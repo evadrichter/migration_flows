@@ -1,0 +1,967 @@
+---
+title: 'Predicting global migration flows'
+date: "06/05/2021"
+author: "Eva Richter; Sebastian Dodt"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+ 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Loading required libraries
+library(ggthemes)
+library(tidymodels)
+library(parsnip)
+library(rpart)
+library(rpart.plot)
+library(plotmo)
+library(keras)
+library(tensorflow)
+library(reticulate)
+library(vip)
+library(ggplot2)
+library(scales)
+library(plm)
+library(ggpubr)
+library(leaps)
+library(caret)
+library(yardstick)
+library(xgboost)
+```
+
+# Predicting global migration flows
+
+## 1. Research question, aim of this project and potential ethical concerns
+
+Global migration is both an old and a new complex social phenomenon. It is old because migration is as old as humanity itself - and it is new because globalisation and rapid technological progress have made it a ubiquitous fact of modern life. Our motivation for this statistical analysis is simple: can we predict whether a country will experience an inflow or an outflow of migrants and how large this population change will be relative to its total population in a given year? We consider indicators of a country's wealth, income inequality, human development, conflict, democracy, human rights and geographical region to make predictions. 
+
+The report is structured as follows: we will first assess the ethical implications and challenges of our project. Then, we will provide a brief introduction into the dataset and perform some basic exploratory data analysis. As a baseline model, we consider multiple linear regression and compare this model to other machine learning techniques with varying degrees of flexibility and interpretability. In total, we compare a single decision tree, random Forest regression, extreme gradient boosting, a neural network, ridge regression and the lasso. We also build a DAG for global migration and briefly attempt techniques for causal machine learning. At the end, we address the limitations and remaining uncertainties of our analysis.
+
+The model with the best predictive accuracy used in this analysis was the extreme gradient boost. The variables that turned out to be most important for predicting migration across all models were GDP per capita, Democracy Index, Child Mortality Rate, GDP growth, Income level and Human Development.
+
+### Ethical assessment 
+
+There are two concerns that must be considered when performing analysis of migration, particularly when the models predict future migration patterns. First, studies predicting increasing future migration have, in many cases, led to a "securitisation" of migrants and refugees. Securitisation is defined by Buzan et al. (1998) [2] as the discursive strategy of political actors to bring a certain issue to a security-level by presenting it as a great threat to some object. This allows the actor to justify more extreme countermeasures. 
+
+For instance, during the refugee crisis of 2015, politicians sought to frame arriving refugees as a security issue, for domestic law and order as well as for European identity. Predictions for the future of migration - in particular "climate refugees" - have often been grim, with some predicting up to 1.5 billion refugees by 2050 (Chen and Caldeira, 2020) [3]. Others question the scientific basis of these claims, arguing that there will not be an "environmental exodus" (Myers and Kent, 1995) [5] from the South to the North, saying, "this self-referencing narrative in scientific literature and policy reports has the consequence of entrenching climate migration as a looming security crisis without an empirical scientific basis.” (Boas et al., 2019) [1]. Instead, they say migration is more complex and impossible to predict. Irrespective of one's estimate, scientists ought to be conscious of the uncertainties of their predictions and the possible securitisation and subsequent militarisation that might follow unreasonably high estimates. Therefore, we will not use our models to make predictions for future years. Our goal is to understand migration patterns from the past. 
+
+Second, a more immediate concern of predicting migration, especially when it is done on a small regional level, is the possible misuse of machine learning by states to predict when and where migration streams happen and to send security forces to stop migrants from leaving or entering a country. From Europe to the U.S., borders have become strongly militarised and we fear machine learning could potentially be used similarly to predictive policing to suppress and halt migrants and refugees. As our model is on a yearly and country-level, we do not run risk of this problem.
+
+Despite these concerns, our analysis could provide a useful contribution to the scientific understanding of global migration. What are the attributes of countries that experience the largest inflows of migrants, what are the attributes of countries that experience the largest outflows? Can and should migration, which is at its core a social phenomenon, even be predicted using machine learning models? 
+
+## 2. Brief introduction into the dataset
+
+Our panel dataset includes 1297 observations with a numerical outcome variable indicating net migration to or from a number of countries relative to its population size in the years 1992, 1997, 2002, 2007 and 2012, eleven numerical treatment variables indicating the agricultural area relative to land size, official development assistance relative to gross national income, per cent of population with access to electricity, GDP growth, GDP per capita, child mortality rate, unemployment as percentage of total labour force, democracy index, battle deaths, human rights index and a human development index, and two categorical variables indicating the income level of a country and the continent. The data is derived from World Bank statistical estimates [4].
+
+Unfortunately, our dataset includes many missing observations. Out of 1297 observations, 737 rows have a predictor variable with at least one missing observation. We handle missing observations in different ways throughout this analysis. 
+
+```{r}
+# Reading in the data
+migration_data <- read.csv("global_migration.csv")
+
+# Checking structure of data
+glimpse(migration_data)
+```
+
+## 3. Basic exploratory analysis
+
+Grouped by income level, we plot GDP per capita of a country against the net migration relative to population size in a given year. We can see a slight, although not strong positive relationship. There seem to be two potential outliers that we should keep in mind. 
+
+```{r}
+# Looking at some of the relationships in the data
+migration_data %>%
+  ggplot(aes(GDP.per.capita..current.US.., migration_rel, color=Income.level)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(x = "GDP per capita", y = "Net migration relative to population") +
+  scale_colour_colorblind() +
+  theme_clean()
+```
+
+
+Next, we look at some other relationships in the data. Not all seem to be as clear as we might expect. At a later stage, we will test this statistically. 
+
+```{r}
+migration_data %>%
+  select(migration_rel, Dem.Index:Hum.Dev) %>%
+  pivot_longer(Dem.Index:Hum.Dev, names_to = "dim", values_drop_na=TRUE) %>%
+  ggplot(aes(value, migration_rel, color = dim)) +
+  geom_point(alpha = 0.4, show.legend = FALSE) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~dim, scales = "free_x") +
+  labs(x = NULL) +
+  scale_colour_colorblind() +
+  theme_clean()
+```
+
+
+### Data preparation
+
+To evaluate and compare the performance of our models, we randomly split the data into a training set containing 75% of the observations and hold out a test set. We further split our training set in five parts in order to tune our model using 5-fold cross-validation. 
+
+```{r}
+set.seed(123)
+migration.split <- rsample::initial_split(migration_data)
+
+# Training and test data
+training <- training(migration.split)
+test <- testing(migration.split)
+
+
+```
+
+
+## 4. Baseline model: multiple linear regression
+
+First, we will specify the linear model: 
+
+```{r}
+# Specify the linear model:
+baseline_model <- linear_reg() %>% 
+  set_engine("lm") %>% 
+  set_mode("regression") %>% 
+  translate()
+```
+
+Before we fit the model, we need to prepare our data for linear modelling. Since we have two categorical predictors with more than two levels (`Income level` and `Continent`), we create dummy variables as indicators of whether an observation belongs to a particular group or not. To avoid the loss of important information, we impute missing values. We believe that simply imputing the mean/median value would be an overly simplistic solution. Thus, we perform a *bag impute*. 
+
+We also rescale our numerical predictors to improve their distribution. 
+
+```{r}
+migration.recipe <- recipe(formula = migration_rel ~., data = training) %>%
+  step_rm(X, Country.Name, Country.Code,Year) %>% # remove these variables from the analysis
+  step_dummy(Continent, Income.level) %>%     # Creating dummy variables
+  step_bagimpute(GDP.growth..annual...,  GDP.per.capita..current.US.., Unemployment..total....of.total.labor.force...modeled.ILO.estimate.,
+                 Net.ODA.received....of.GNI., Access.to.electricity....of.population., 
+                 Mortality.rate..under.5..per.1.000.live.births., Dem.Index, Human.Rights, Hum.Dev, Agricultural.land....of.land.area.) %>% # Performing Bag impute
+  step_log(GDP.per.capita..current.US.., Agricultural.land....of.land.area.,
+           Mortality.rate..under.5..per.1.000.live.births.) %>%
+  prep()
+
+# Creating a workflow for linear regression
+linear.workflow <- 
+  workflows::workflow() %>%
+  add_recipe(migration.recipe) %>%
+  add_model(baseline_model)
+```
+
+Fitting an initial model to the training data gives us a good overview of the significance of predictors and how strongly they influence the model. Very briefly, we can see that the GDP per capita and democracy index seem to be important predictors of *relative migration*. What does this mean? Richer countries tend to experience higher values for relative migration. Counter-intuitively, more autocratic countries seem to have higher inflows of migrants on average as well. We will test the robustness of these results in other models throughout this analyis. 
+
+```{r}
+# Building an initial model
+initial.fit <- linear.workflow %>%
+  fit(training)
+
+tidy(initial.fit)
+```
+
+### Considering Model diagnostics:
+
+To check the assumptions of ordinary least-squares linear regression, we check the diagnostic plots. The residuals plotted against fitted values look fine, but the Cook's distance plot reveals that there are some outliers. We will not remove them from the analysis as we trust the World Bank statistical estimates to have recorded them correctly. The highest value for relative migration inflow (and one of the outliers) is Qatar in 2007 with a total relative inflow of `0.75064` per cent. Some research reveals that Qatar experienced a large inflow of labour migrants in the early 2000s [7]. 
+
+
+```{r}
+
+# Model diagnostics
+par(mfrow = c(2,2))
+plot(initial.fit$fit$fit$fit)
+
+```
+
+However, to truly assess the performance of our data on new data (which is the metric we will use to compare this model), we need to compute the RMSE for Test Data. The *last_fit* function trains the model, applies pre-processing steps and calculates the RMSE on new data all in one step. The RMSE for our multiple linear regression model is `0.04670849`. 
+
+```{r, message = FALSE, warning = FALSE}
+# Assessing our model
+linear.fit <- linear.workflow %>%
+  last_fit(split = migration.split)
+
+# Performance Metrics
+lin.metrics <- linear.fit %>%
+  collect_metrics()
+lin.metrics
+
+# Collecting predictions made by the model
+lin.pred <- linear.fit %>%
+  collect_predictions()
+
+```
+
+Visualising our results:
+
+```{r}
+ggplot(data = lin.pred,
+       mapping = aes(x = .pred, y = migration_rel)) +
+  geom_point(color = 'blue', alpha = 0.25) +
+  geom_abline(intercept = 0, slope = 1, color = 'darkorange') +
+  labs(title = 'Baseline Model: Predicted vs. actual migration',
+       x = 'Predicted Net Migration',
+       y = 'Actual Net Migration') +
+  theme_clean()
+```
+
+### Automated subset selection:
+
+In our model, some predictors are insignificant with a p-value `>0.05`. Therefore, we use subset selection to choose a subset of our parameters to be used in our model. This is done through the function `regsubsets()` which calculates the best possible model for each possible subset among our 16 predictors. 
+The models are compared based on their adjusted $R^2$, their Mallow's Cp (`CP`), and Schwartz's information criterion (`BIC`). Each of these is penalising models that contain too many variables, potentially causing it to have a higher bias. The adjusted r-squared (`Adj.R2`) tells us the variation of the data explained through the model, adjusted for the number of variables used. 
+`CP` is minimised in a subset with just 7 predictors which, because of its simplicity, will be subsequently used. 
+
+```{r}
+subset_selection <- regsubsets(migration_rel ~., 
+                               data = training %>% select(-X, -Country.Name, 
+                                                          -Country.Code, -Year,
+                                                          -Continent), nvmax = 13)
+linear_subsets <- summary(subset_selection)
+data.frame(
+  Adj.R2 = which.max(linear_subsets$adjr2),
+  CP = which.min(linear_subsets$cp),
+  BIC = which.min(linear_subsets$bic)
+)
+```
+
+```{r}
+coef(subset_selection, 7) 
+```
+The variables used are:
+- annual growth of GDP
+- child mortality
+- democracy index
+- human development index
+- income level
+
+All but the last were ranked highest for importance by the `vip()` function above.
+
+
+We fit another linear model on these three variables.
+```{r}
+baseline_fit_subset <- baseline_model %>%
+  fit(migration_rel ~ GDP.growth..annual... + 
+        Mortality.rate..under.5..per.1.000.live.births. +
+        Income.level +
+        Dem.Index +
+        Hum.Dev,
+      data = training)
+tidy(baseline_fit_subset)
+
+```
+All variables are significant with a p-value below `0.001`.
+
+```{r}
+# Updating the workflow to only consider relevant variables:
+reg.sub <- linear.workflow %>%
+  update_formula(migration_rel ~ GDP.growth..annual... + 
+        Mortality.rate..under.5..per.1.000.live.births. +
+        Income.level +
+        Dem.Index +
+        Hum.Dev) %>%
+  last_fit(migration.split)
+
+# Collecting the metrics:
+reg.metrics <-
+  reg.sub %>%
+  collect_metrics()
+
+reg.pred <- 
+  reg.sub %>%
+  collect_predictions()
+
+
+```
+Both the root-mean squared error and the $R^2$ value worsened slightly. Using just five parameters, this model is very close to the performance of the higher dimensional model above. We will therefore use it as a benchmark for our further analysis.
+
+
+```{r}
+# Plotting results from regularised subset:
+ggplot(data = reg.pred,
+       mapping = aes(x = .pred, y = migration_rel)) +
+  geom_point(color = '#006EA1') +
+  geom_abline(intercept = 0, slope = 1, color = 'orange') +
+  labs(title = 'Linear baseline model',
+       x = 'Predicted Migration',
+       y = 'Actual Migration')
+```
+
+
+## 5. Maximising interpretability: fitting a single decision tree
+
+To maximise interpretability, we fit a single decision tree to the data. Although trees tend to have much lower prediction accuracy compared to other approaches used in this analysis, they are highly interpretable. In the first step of the process, we fit a single decision tree that iteratively divides the feature space to minimise the RSS at each split until the sub-groups become too small or another split would not improve the RSS. To make predictions, the value of net migration is averaged across all observations in a resulting subgroup.
+
+
+```{r}
+# Defining the formula
+migration.form <- migration_rel ~ Agricultural.land....of.land.area. + Net.ODA.received....of.GNI. +
+  Access.to.electricity....of.population. + GDP.growth..annual... + GDP.per.capita..current.US.. +
+  Mortality.rate..under.5..per.1.000.live.births. + Unemployment..total....of.total.labor.force...modeled.ILO.estimate. + Dem.Index + Battle.Deaths + Human.Rights + Hum.Dev + Continent + Income.level
+
+# Fitting a single decision tree with rpart
+tree.fit = rpart(migration.form, data=training)
+
+# Plotting the tree:
+rpart.plot(tree.fit)
+
+
+```
+
+For this dataset, this results in a tree with nine subregions, four of which contain less than one per cent of the observations. This is probably too complex, and would achieve very low prediction accuracy on new data. Thus, we prune the tree in a second step, meaning we choose a better subtree with lower variance from the original tree. To do that, we perform cross-validation for varying tree sizes and choose the tree size with the lowest cross-validation error. In our example, the error is lowest at a tree size of 7 leaves (see below).
+
+```{r}
+# Choosing the best tree-size, given from CV
+cv.error <- tree.fit$cptable[which.min(tree.fit$cptable[,"xerror"]),"CP"]
+
+# Pruning the tree to avoid overfitting:
+prune <- prune(tree.fit,cp=cv.error)
+
+# Visualising the final tree: 
+rpart.plot(prune, yesno=2)
+plotmo(prune, degree1 = 1, degree2 = 1)
+```
+
+```{r}
+# Testing the performance of the tree on new data
+predicted.tree <- predict(prune, newdata = test)
+
+tree.metrics = RMSE(predicted.tree, test$migration_rel)
+
+tree.metrics
+```
+
+
+## 6. Interpretation of the pruned tree
+
+The resulting tree is a simple and very understandable model. The figure above shows the decisions of the tree algorithm at each node. The average of the response variable *Net migration* for the entire dataset is `-0.0022`. From there, the GDP per capita is determined to be the most important variable of the dataset and split in values above `7222` and below `7222` US Dollar per capita. If GDP per capita is below that value, net migration averaged lower. This indicates that poorer countries tend to experience an outflow of their population towards richer countries, which confirms our theoretical expectation. From there, the data is further split according to the net ODA received as percentage of Gross National Income. Countries that receive more development assistance are binned into the lowest category, which is consistent with our theory that populations tend to leave poorer countries. The other resulting subgroup is split according to the democracy index of the country. If a country has a higher democracy index, observations are binned into one of the lower categories. As already states in the linear model, this is not consistent with our theory that people tend to flee from autocratic rule. This could either be a result of a false theory, or poor data quality. 
+
+Two striking features of the resulting decision tree stand out. Firstly, sixty-one per cent of all observations are in one of seven categories, while three other categories have less than two per cent of all observations! This suggests that, although we can interpret the decisions of the tree model very well, the model would not help us make predictions about future migration flows. In addition, only five of the variables are used in the pruned tree. Thus, we also cannot learn much about how the other predictors in the dataset are related with the response variable. However, the fact that the algorithm only used so few variable in turn also helps us visualising the model in a perspective plot (see above) and understanding how the feature space was divided. 
+
+## 7. Maximising prediction accuracy: extreme gradient boost
+
+The next approach combines many trees in order to build models with higher prediction accuracy. The gradient boost fits many trees and iteratively fits each model to the residuals of the previous fit. It is less understandable than a single decision tree but has higher prediction accuracy.
+
+```{r, message=FALSE, warning=FALSE, echo = FALSE}
+# Creating folds for model tuning
+migration.folds <- training%>% 
+  rsample::vfold_cv(v=5)
+
+# Recipe specification
+boost.recipe <- recipe(formula = migration_rel ~., data = training) %>%
+  step_rm(X, Country.Name, Country.Code,Year) %>% # remove these variables from the analysis
+    step_dummy(Continent, Income.level) %>%     # Creating dummy variables
+  step_bagimpute(GDP.growth..annual...,  GDP.per.capita..current.US.., Unemployment..total....of.total.labor.force...modeled.ILO.estimate.,
+                 Net.ODA.received....of.GNI., Access.to.electricity....of.population., 
+                 Mortality.rate..under.5..per.1.000.live.births., Dem.Index, Human.Rights, Hum.Dev, Agricultural.land....of.land.area.) %>% # Performing Bag impute
+  step_log(GDP.per.capita..current.US.., Agricultural.land....of.land.area.,
+           Mortality.rate..under.5..per.1.000.live.births.) %>%
+  prep()
+
+
+# Model specification: 
+boost <- 
+  boost_tree(
+    mode="regression",
+    trees = 1000,
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune()
+  ) %>%
+  set_engine("xgboost", objective = "reg:squarederror")
+
+# Defining the grid on which the model will be tuned
+migration.grid <- 
+  dials::grid_max_entropy(
+    parameters(
+      min_n(),
+      tree_depth(),
+      learn_rate(),
+      loss_reduction()
+    ), 
+    size = 60
+  )
+
+# Define workflow: 
+boost.workflow <- 
+  workflows::workflow() %>%
+  add_model(boost) %>%
+  add_recipe(boost.recipe)
+
+set.seed(123)
+boost.migration <- 
+  tune_grid(boost.workflow,
+            resamples = migration.folds,
+            grid = migration.grid,
+            control = control_grid(verbose = TRUE))
+boost.migration$.notes
+```
+
+
+```{r}
+best.parameter <- boost.migration %>%
+  select_best(metric = "rmse")
+
+# Finalize model with best parameters:
+boost_model_final <- boost %>%
+  finalize_model(best.parameter)
+
+# Updating the latest workflow
+wf.final <- boost.workflow %>%
+  update_model(boost_model_final)
+
+boost.final <- wf.final %>%
+  last_fit(split = migration.split)
+
+# Plot variable importance
+boost.final %>% 
+  pluck(".workflow", 1) %>%   
+  pull_workflow_fit() %>% 
+  vip(aesthetics = list(alpha = 0.8, fill = "darkred"))
+
+
+boost.pred <- boost.final %>%
+  collect_predictions()
+  
+ggplot(data = boost.pred,
+     mapping = aes(x = .pred, y = migration_rel)) +
+  geom_point(color = 'blue', alpha = 0.25) +
+  geom_abline(intercept = 0, slope = 1, color = 'darkorange') +
+  labs(title = 'Extreme Gradient Boost: Predicted vs. actual migration',
+       x = 'Predicted Net Migration',
+       y = 'Actual Net Migration') +
+  theme_clean()
+
+  
+boost.metrics <- boost.final %>%
+  collect_metrics()
+
+```
+The RMSE of Extreme Gradient Boosting on our testing data is `0.04034651`. So far, extreme gradient boosting is our best-performing model. The variable importance confirms the intuition we have gained from the baseline model: GDP per capita and democracy index are the most important variables in the model. The extreme gradient boost also lists GDP growth, agricultural land of total land area and child mortality rate as important predictors of net relative migration. 
+
+## 7. Maximising prediction accuracy: neural net
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+# Define the model
+set.seed(123)
+nnet_fit <-
+  mlp(epochs = 100, hidden_units = 5, dropout = 0.1) %>%
+  set_mode("regression") %>% 
+  set_engine("nnet", verbose = 0) 
+
+# Define workflow: 
+nnet.workflow <- 
+  workflows::workflow() %>%
+  add_model(nnet_fit) %>%
+  add_recipe(boost.recipe)
+
+set.seed(123)
+nnet.migration <- 
+  tune_grid(nnet.workflow,
+            resamples = migration.folds,
+            grid = migration.grid,
+            control = control_grid(verbose = TRUE))
+
+best.parameter <- nnet.migration %>%
+  select_best(metric = "rmse")
+```
+
+
+```{r}
+# Finalize model with best parameters:
+nnet_model_final <- nnet_fit %>%
+  finalize_model(best.parameter)
+
+# Updating the latest workflow
+nnet.wf <- nnet.workflow %>%
+  update_model(nnet_model_final)
+
+nnet.final <- nnet.wf %>%
+  last_fit(split = migration.split)
+
+# Collecting predictions made by the model
+nnet.pred <- nnet.final %>%
+  collect_predictions()
+
+nnet.metrics <- nnet.final %>%
+  collect_metrics()
+
+ggplot(data = nnet.pred,
+       mapping = aes(x = .pred, y = migration_rel)) +
+  geom_point(color = 'blue', alpha = 0.25) +
+  geom_abline(intercept = 0, slope = 1, color = 'darkorange') +
+  labs(title = 'Baseline Model: Predicted vs. actual migration',
+       x = 'Predicted Net Migration',
+       y = 'Actual Net Migration') +
+  theme_clean()
+
+```
+
+The resulting RMSE value is 0.0457137. Although this is worse than the prediction from the extreme gradient boost, this model performed better than the baseline linear model and the single regression tree. 
+
+## 8. Our own implementation of the gradient descent: ridge regression
+
+
+Ridge regression is similar to the least squares method which sought to minimise the $RSS$. Additionally, the function to be minimised involves a penalty term for the size of the coefficient estimates $\hat\beta^R$. The full function to be minimised is defined as
+$$
+L(\beta) =\sum_{i=1}^{n}{(y_i - \beta_0- \sum_{j=1}^{p}{\beta_j x_{ij}} )^2} + \lambda \sum_{j=1}^{p}{\beta_j^2}
+$$
+where the non-negative $\lambda$ is the tuning parameter.
+The latter part of the sum is called "shrinkage penalty" as it grows when $\beta$ is estimated to be higher. It has the effect of shrinking the overall coefficient estimates $\hat\beta$. 
+
+The equation can also be written as
+$$
+L(\beta) =\sum_{i=1}^{n}{(y_i - \beta_0- \beta_1 x_1^{(i)} -\beta_2 x_2^{(i)} - ... - \beta_nx_n^{(i)} )^2} + \lambda \sum_{j=1}^{p}{\beta_j^2}
+$$
+
+A closed form solution exists because the sum of diagonal elements on the matrix ensures that there exists an inverse.
+$$
+\frac{\partial L(\beta)}{\partial \beta_k} = 2 \sum_{i=1}^{n}{(y_i - \beta_0- \beta_1 x_1^{(i)} -\beta_2 x_2^{(i)} - ... - \beta_nx_n^{(i)} ) x_k^{(i)}} + 2\lambda \beta_k
+$$
+
+It adds some bias to the model, however, it also increases efficiency significantly.
+
+Ridge allows us to use a high number of parameters in our prediction without overfitting as it insures sparsity. 
+
+We will implement ridge regression using a self-programmed gradient descent.
+
+The loss function and the gradient function are as derived above. The gradient function is multiplied by `-1`, as we are aiming to _reduce_ the loss function.
+
+
+```{r}
+loss_function <- function(x, y, beta, lambda) {
+  sum((x %*% beta - y)^2) + lambda * sum((beta)^2)
+}
+gradient_function <- function(x, y, beta, lambda) {
+  -2 * (t(x) %*% (y - x %*% beta) + lambda * beta)
+}
+```
+
+Gradient descent will be implemented using the Barzilai–Borwein method for step size.
+
+The formula for the step size is as follows:
+$$
+\gamma_n = \frac{|(\mathbf{x_n}-\mathbf{x_{n-1}})^T [\Delta F(\mathbf{x_n})-\Delta F(\mathbf{x_{n-1}})]}{\| \Delta F(\mathbf{x_n})-\Delta F(\mathbf{x_{n-1}})\ \|^2 }
+$$
+where $\Delta F(\mathbf{x_n})$ is defined as the gradient function $\frac{\partial L(\beta)}{\partial \beta_k}$ above.
+
+```{r}
+gamma <- function(x, y, beta_old, beta_new, lambda) {
+  abs( t(beta_new - beta_old) %*% 
+        (gradient_function(x = X, y = y, beta = beta_new, lambda = lambda) - 
+           gradient_function(x = X, y = y, beta = beta_old, lambda = lambda)) ) / 
+        ( t(gradient_function(x = X, y = y, beta = beta_new, lambda = lambda) - 
+           gradient_function(x = X, y = y, beta = beta_old, lambda = lambda)) %*%
+            (gradient_function(x = X, y = y, beta = beta_new, lambda = lambda) - 
+           gradient_function(x = X, y = y, beta = beta_old, lambda = lambda))) 
+  }
+```
+
+
+We split the training dataset in `X` and `y`. Furthermore, we add a column to `X` with the intercept term of `1` in each observation. This has the same effect as adding $\beta_0$ to the loss function and gradient function above.
+
+```{r, warning = FALSE}
+# Make sure we don't use data with missing values:
+migration.train <- bake(migration.recipe, training)
+row.names(migration.train) <- c(1:nrow(migration.train))
+migration.test <- bake(migration.recipe, test)
+
+X <- migration.train %>% 
+  select(-migration_rel) %>%
+  as.matrix()
+intercept <- rep(1, nrow(X))
+X <- as.matrix(cbind(intercept, X))
+y <- migration.train %>% 
+  select(migration_rel) %>% 
+  as.matrix()
+p <- ncol(X)
+p
+```
+
+`p` appears to be 20 now, yet this includes the intercept. It is still 19 parameters.
+
+The $\lambda$ used to begin with is `1`. We will examine the optimal $\lambda$ choice later.
+
+```{r}
+lambda_used <- 1
+```
+
+Initial starting position. We first start with $\mathbf{\beta}=\mathbf{0}$, i.e., $\beta$ being a zero-vector. We subsequently determine the first loss function value and gradient value. The starting step size is determined to be $10^{-10}$. 
+
+
+```{r}
+beta0 <- rep(0, p) %>% 
+  as.matrix()
+#beta <- as.matrix(beta0)
+loss0 <- loss_function(X, y, beta0, lambda_used)
+grad0 <- gradient_function(X, y, beta0, lambda_used)
+gamm0 <- 10^-10
+beta1 <- beta0 - gamm0 * grad0
+loss1 <- loss_function(X, y, beta1, lambda_used)
+beta_before_old <- beta0
+beta_old <- beta1
+loss_old <- loss0
+loss_new <- loss1
+```
+
+We let the gradient run until the subsequent loss function value is only $10^{-10}$ smaller than the previous. 
+
+```{r, include = FALSE}
+steps <- 0
+while (abs(loss_old - loss_new) > 0.00000000000001) {
+  gradient <- gradient_function(X, y, beta_old, lambda_used)
+  gamma_new <- gamma(X, y, beta_before_old, beta_old, lambda_used)
+  beta_new <- beta_old - as.numeric(gamma_new) * gradient
+  beta_before_old <- beta_old
+  beta_old <- beta_new
+  loss_old <- loss_new
+  loss_new <- loss_function(X, y, beta_new, lambda_used)
+  steps <- 1 + steps
+  if (steps/1000 == round(steps/1000)) print(loss_old - loss_new)
+}
+beta_estimates <- beta_new
+```
+
+
+The number of steps taken by the algorithm:
+```{r}
+steps
+```
+
+The estimates for $\beta$ are as follows:
+```{r}
+beta_estimates
+```
+
+
+The predictions are stored in `outcome_gradient`:
+```{r}
+outcome_gradient <- X %*% 
+  beta_estimates
+```
+
+The root-mean squared error of our model is:
+```{r}
+rmse <- sqrt(mean((y-outcome_gradient)^2))
+rmse
+```
+
+
+Now, we will start the algorithm from a random value for $\beta$. We will choose very small values as the values were previously estimated to be within $10^{-6}$ and $-10^{-6}$. 
+
+```{r}
+set.seed(3)
+beta0 <- rnorm(p, sd = 0.00005)
+loss0 <- loss_function(X, y, beta0, lambda_used)
+grad0 <- gradient_function(X, y, beta0, lambda_used)
+gamm0 <- 10^-10
+beta1 <- beta0 - gamm0 * grad0
+loss1 <- loss_function(X, y, beta1, lambda_used)
+beta_before_old <- beta0
+beta_old <- beta1
+loss_old <- loss0
+loss_new <- loss1
+steps <- 0
+while (abs(loss_old - loss_new) > 0.00000000000001) {
+  gradient <- gradient_function(X, y, beta_old, lambda_used)
+  gamma_new <- gamma(X, y, beta_before_old, beta_old, lambda_used)
+  beta_new <- beta_old - as.numeric(gamma_new) * gradient
+  beta_before_old <- beta_old
+  beta_old <- beta_new
+  loss_old <- loss_new
+  loss_new <- loss_function(X, y, beta_new, lambda_used)
+  steps <- 1 + steps
+  #if (steps/1000 == round(steps/1000)) print(loss_old - loss_new)
+}
+steps
+outcome_gradient <- X %*% 
+  beta_new
+rmse <- sqrt(mean((y-outcome_gradient)^2))
+rmse
+
+```
+
+### Test error
+
+Splitting the test dataset in $\mathbf{X}$ and $\mathbf{y}$.
+
+```{r}
+X_test <- migration.test %>%
+  select(-migration_rel) %>%
+  as.matrix()
+intercept <- rep(1, nrow(X_test))
+X_test <- cbind(intercept, X_test)
+y_test <- migration.test %>%
+  select(migration_rel) %>% 
+  as.matrix()
+
+```
+
+Calculating the performance on the testing data:
+
+```{r}
+pred_gradient <- X_test %*% 
+  beta_new 
+ridge_test_results <- cbind(y_test, pred_gradient)
+colnames(ridge_test_results) <- c("actual",".pred")
+ridge_test_results <- data.frame(ridge_test_results)
+rbind(rmse(ridge_test_results, 
+     truth = actual,
+     estimate = .pred),
+     rsq(ridge_test_results, 
+     truth = actual,
+     estimate = .pred) )
+```
+
+
+### Cross-validation
+We will use cross-validation to determine the optimal $\lambda$.
+
+First, we will divide our data in seven chunks of 139 observations each. 
+```{r}
+dim(migration.train)
+973/7
+k <- 7
+chunks <- split(migration.train, sample(1:k, nrow(migration.train), replace=T))
+```
+
+Function for fitting our ridge regression which returns the mean squared error for each lambda that is put in.
+```{r}
+fit_ridge_regression <- function(lambda, data) {
+  intercept <- rep(1, nrow(data))
+  X_test <- data %>% 
+    select(-migration_rel) %>% 
+    as.matrix()
+  X_test <- cbind(intercept, X_test)
+  y_test <- data %>%
+    select(migration_rel) %>% 
+    as.matrix()
+  subset_rows <- as.integer(row.names(X_test))
+  X <- migration.train[-subset_rows,] %>%
+    select(-migration_rel)
+  intercept <- rep(1, nrow(X))
+  X <- as.matrix(cbind(intercept, X))
+  y <- migration.train[-subset_rows,] %>% 
+    select(migration_rel) %>% 
+    as.matrix()
+  p <- ncol(X)
+  lambda_used <- lambda
+  set.seed(3)
+  beta0 <- rnorm(p, sd = 0.00005)
+  loss0 <- loss_function(X, y, beta0, lambda_used)
+  grad0 <- gradient_function(X, y, beta0, lambda_used)
+  gamm0 <- 10^-10
+  beta1 <- beta0 - gamm0 * grad0
+  loss1 <- loss_function(X, y, beta1, lambda_used)
+  beta_before_old <- beta0
+  beta_old <- beta1
+  loss_old <- loss0
+  loss_new <- loss1
+  steps <- 0
+  while (abs(loss_old - loss_new) > 0.00000000000001) {
+    gradient <- gradient_function(X, y, beta_old, lambda_used)
+    gamma_new <- gamma(X, y, beta_before_old, beta_old, lambda_used)
+    beta_new <- beta_old - as.numeric(gamma_new) * gradient
+    beta_before_old <- beta_old
+    beta_old <- beta_new
+    loss_old <- loss_new
+    loss_new <- loss_function(X, y, beta_new, lambda_used)
+    steps <- 1 + steps
+    #if (steps/1000 == round(steps/1000)) print(loss_old - loss_new)
+  }
+  pred_gradient <- X_test %*% beta_new 
+  ridge_test_results <- cbind(y_test, pred_gradient)
+  colnames(ridge_test_results) <- c("actual",".pred")
+  ridge_test_results <- data.frame(ridge_test_results)
+  rmse(ridge_test_results, 
+       truth = actual,
+       estimate = .pred)[3] %>%
+    as.numeric()
+}
+```
+
+Calculating the root-mean squared error for each lambda that is tested
+
+```{r}
+lambdas_to_be_tried <- 1.0001^seq(1,10,0.1) - 1
+rmse_per_lambda <- vector(length = length(lambdas_to_be_tried))
+for (i in lambdas_to_be_tried) {
+  for (j in 1:7) {
+    cv_error <- vector(length = 7)
+    cv_error[j] <- fit_ridge_regression(lambda = i, data = chunks[[j]])
+  }
+  rmse_per_lambda[i] <- mean(cv_error)
+}
+lambdas_to_be_tried[which.max(rmse_per_lambda)]
+```
+
+Using $\lambda = 0.0001$ for a model based on all of our training data, we see that our test error improves from `0.044`  to `0.035`. However, our $R^2$ has decreased to `11.8%`. 
+
+```{r}
+X <- migration.train %>% select(-migration_rel) %>% as.matrix()
+intercept <- rep(1, nrow(X))
+X <- as.matrix(cbind(intercept, X))
+y <- migration.train %>% select(migration_rel) %>% as.matrix()
+p <- ncol(X)
+X_test <- migration.test %>%
+  select(-migration_rel) %>%
+  as.matrix()
+intercept <- rep(1, nrow(X_test))
+X_test <- cbind(intercept, X_test)
+y_test <- migration.test %>%
+  select(migration_rel) %>% 
+  as.matrix()
+set.seed(3)
+lambda_used <- 0.0001
+beta0 <- rnorm(p, sd = 0.00005)
+loss0 <- loss_function(X, y, beta0, lambda_used)
+grad0 <- gradient_function(X, y, beta0, lambda_used)
+gamm0 <- 10^-10
+beta1 <- beta0 - gamm0 * grad0
+loss1 <- loss_function(X, y, beta1, lambda_used)
+beta_before_old <- beta0
+beta_old <- beta1
+loss_old <- loss0
+loss_new <- loss1
+steps <- 0
+while (abs(loss_old - loss_new) > 0.00000000000001) {
+  gradient <- gradient_function(X, y, beta_old, lambda_used)
+  gamma_new <- gamma(X, y, beta_before_old, beta_old, lambda_used)
+  beta_new <- beta_old - as.numeric(gamma_new) * gradient
+  beta_before_old <- beta_old
+  beta_old <- beta_new
+  loss_old <- loss_new
+  loss_new <- loss_function(X, y, beta_new, lambda_used)
+  steps <- 1 + steps
+  #if (steps/1000 == round(steps/1000)) print(loss_old - loss_new)
+}
+pred_gradient <- X_test %*% beta_new 
+ridge_test_results <- cbind(y_test, pred_gradient)
+colnames(ridge_test_results) <- c("actual",".pred")
+ridge_test_results <- data.frame(ridge_test_results)
+rbind(rmse(ridge_test_results, 
+     truth = actual,
+     estimate = .pred),
+     rsq(ridge_test_results, 
+     truth = actual,
+     estimate = .pred) )
+
+ridge.metrics <- rmse(ridge_test_results, 
+     truth = actual,
+     estimate = .pred)
+
+```
+
+Cross-validation has improved the error on the test data significantly and our model (`rmse = 0.04582738`) now performs better than the linear model baseline model and the single regression tree.
+
+
+## 9. High-dimensionality: Considering the LASSO
+
+The LASSO is a shrinkage method for linear regression. In this section, we include quadratic transformations of our variables to make it high-dimensional and implement a penalised regression model. However, this does not seem to improve our prediction accuracy. 
+
+
+```{r}
+# Recipe specification
+lasso.recipe <- recipe(formula = migration_rel ~., data = training) %>%
+  step_rm(X, Country.Name, Country.Code,Year) %>% # remove these variables from the analysis
+    step_dummy(Continent, Income.level) %>%     # Creating dummy variables
+  step_bagimpute(GDP.growth..annual...,  GDP.per.capita..current.US.., Unemployment..total....of.total.labor.force...modeled.ILO.estimate.,
+                 Net.ODA.received....of.GNI., Access.to.electricity....of.population., 
+                 Mortality.rate..under.5..per.1.000.live.births., Dem.Index, Human.Rights, Hum.Dev, Agricultural.land....of.land.area.) %>% # Performing Bag impute
+  step_poly(Dem.Index, Human.Rights, Hum.Dev, Agricultural.land....of.land.area.,
+            degree = 2, role="predictor") %>%
+  prep() 
+
+lasso.model <- linear_reg(penalty = 0.1, mixture = 1) %>%
+  set_engine("glmnet")
+
+lasso.wf <- workflow() %>%
+  add_model(lasso.model) %>%
+  add_recipe(lasso.recipe) 
+```
+
+
+```{r, warning= FALSE, message = FALSE}
+# Tuning parameters of our LASSO estimate
+set.seed(1234)
+boot.lasso <- bootstraps(training)
+lambda_grid <- grid_regular(penalty(), levels = 50)
+
+set.seed(123)
+# Training the lasso
+lasso_grid <- tune_grid(
+  lasso.wf,
+  resamples = boot.lasso,
+  grid = lambda_grid
+)
+
+# Selecting the best parameters:
+lowest_rmse <- lasso_grid %>%
+  select_best("rmse", maximize = FALSE)
+
+final_lasso <- finalize_workflow(
+  lasso.wf,
+  lowest_rmse
+)
+
+# Collecting results from LASSO metrics:
+lasso.metrics <- last_fit(
+  final_lasso,
+  migration.split
+) %>%
+  collect_metrics()
+
+
+```
+
+
+## 10. Model comparison
+
+Comparing the RMSE of all models, it becomes clear that the extreme gradient boost performed the best on unseen data and would most likely be chosen as our submission to a machine learning competition. 
+
+```{r}
+lin.metrics
+tree.metrics
+boost.metrics
+nnet.metrics
+ridge.metrics
+lasso.metrics
+```
+
+## 12. Concluding remarks and limitations of our model
+
+The most important limitation of our model is the high amount of missing values. Although imputing the values was a good solution to improve the prediction accuracy of our models, it increases the uncertainty we have about our coefficients and variable importance, since imputation could make inaccurate approximations. In this analysis, we have seen that some models can make decent predictions of whether a country will experience a migration inflow or a migration outflow. The most important variables are related to economic/development factors, although we would have to do further work to make causal inferences (as stated before).
+
+
+## 13. References, tutorials and sources from which we used tidymodels
+
+[1] Boas, Ingrid, Carol Farbotko, Helen Adams, Harald Sterly, Simon Bush, Kees van der Geest, and Hanne Wiegel. ‘Climate Migration Myths’. Nature Climate Change 9 (December 2019): 898–903.
+
+[2] Buzan, Barry, Ole Waever, and Jaap de Wilde. Security: A New Framework for Analysis. Boulder, Colo.: Lynne Rienner, 1998.
+
+[3] Chen, Min, and Ken Caldeira. ‘Climate Change as an Incentive for Future Human Migration’. Earth System Dynamics 11, no. 4 (22 October 2020): 875–83. https://doi.org/10.5194/esd-11-875-2020.
+
+[4] Cunningham, Scott. n.d. “8 Panel Data | Causal Inference.” Accessed May 7, 2021. https://mixtape.scunning.com/panel-data.html.
+
+[5] Myers, Norman, and Jennifer Kent. Environmental Exodus: An Emergent Crisis in the Global Arena. Washington D.C.: Climate Institute, 1995.
+
+[6] World Bank. "World Bank Statistical Indicators" The World Bank Group. Accessed May 1st, 2021. https://data.worldbank.org/indicator
+
+[7] The Guardian. n.d. “Qatar’s Migrants: How Have They Changed the Country? | News | Theguardian.Com.” Accessed May 7, 2021. https://www.theguardian.com/news/datablog/2013/sep/26/qatar-migrants-how-changed-the-country.
+
+#### Tutorials:
+
+We would like to emphasise that we did not directly copy any code, but used certain tutorials to get familiar with tidymodels. Here they are: 
+
+[1] https://www.gmudatamining.com/lesson-10-r-tutorial.html#Step_4_Create_a_Workflow
+
+[2] https://www.statmethods.net/advstats/cart.html
+
+[3] https://www.tidymodels.org/start/case-study/
+
+
+
+
+
+
+
+
+
+
+
+
